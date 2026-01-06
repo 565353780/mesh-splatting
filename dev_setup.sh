@@ -19,4 +19,4 @@ cd ../simple-knn
 python setup.py install
 
 cd ../effrdel
-python setup.py install
+pip install -e .
