@@ -1,6 +1,15 @@
 DATA_FOLDER=$HOME/chLi/Dataset/GS/haizei_1
+ITERATIONS=30000
 
-python train.py \
+LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib/stubs:$LIBRARY_PATH \
+  CUDA_VISIBLE_DEVICES=3 \
+  python train.py \
   -s ${DATA_FOLDER}/gs/ \
   -m ${DATA_FOLDER}/meshsplatting/ \
-  --eval
+  --indoor \
+  --eval \
+  --iterations ${ITERATIONS}
+
+python create_ply.py \
+  ${DATA_FOLDER}/meshsplatting/point_cloud/iteration_${ITERATIONS}/ \
+  --out ${DATA_FOLDER}/meshsplatting/point_cloud/iteration_${ITERATIONS}/mesh.ply

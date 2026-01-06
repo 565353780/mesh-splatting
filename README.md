@@ -1,5 +1,13 @@
 # Mesh Splatting
 
+## Download
+
+```bash
+https://download.pytorch.org/models/vgg16-397923af.pth
+->
+$HOME/.cache/torch/hub/checkpoints/vgg16-397923af.pth
+```
+
 ## Setup
 
 ```bash
