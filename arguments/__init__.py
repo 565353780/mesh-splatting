@@ -18,9 +18,10 @@
 # For inquiries contact jan.held@uliege.be
 #
 
-from argparse import ArgumentParser, Namespace
-import sys
 import os
+import sys
+from typing import Optional
+from argparse import ArgumentParser, Namespace
 
 class GroupParams:
     pass
@@ -63,6 +64,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.mesh_file: str = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

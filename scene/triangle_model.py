@@ -19,6 +19,7 @@
 #
 
 import torch
+import trimesh
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
@@ -187,8 +188,7 @@ class TriangleModel:
         torch.save(point_cloud_state_dict, os.path.join(path, 'point_cloud_state_dict.pt'))
 
 
-    def load_ply_file(self, path, device="cuda", active_sh_degree=3, assume_yup_to_zup=False, training_args=None):
-        import trimesh
+    def load_mesh(self, mesh: trimesh.Trimesh, device="cuda", active_sh_degree=3, assume_yup_to_zup=False, training_args=None):
         """
         Load vertices, faces, and SH features from a PLY file into the current object.
         Fields not derivable from the PLY, like vertex_weight, sigma, importance_score, are ignored.
@@ -204,18 +204,6 @@ class TriangleModel:
             if rgb.dtype == np.uint8:
                 return rgb.astype(np.float32) / 255.0
             return rgb.astype(np.float32)
-
-        ply_path = path if path.lower().endswith(".ply") else os.path.join(path, "mesh.ply")
-        if not os.path.isfile(ply_path):
-            raise FileNotFoundError(f"PLY not found at '{ply_path}'")
-
-        mesh = trimesh.load(ply_path, process=False)
-        if not isinstance(mesh, trimesh.Trimesh):
-            # merge scene geometry into one mesh if needed
-            try:
-                mesh = trimesh.util.concatenate([g for g in mesh.dump()])
-            except Exception as e:
-                raise ValueError("Loaded PLY is not a Trimesh and could not be merged") from e
 
         verts_np = mesh.vertices.astype(np.float32).copy()
         if assume_yup_to_zup:
@@ -262,7 +250,7 @@ class TriangleModel:
         self._sigma = self.inverse_exponential_activation(0.0001)
 
         # Optional, quick report
-        print(f"Loaded PLY: {ply_path}")
+        print(f"Loaded PLY: {mesh}")
         print(f"Vertices: {V}, Faces: {faces.shape[0]}, SH degree: {deg}, features_rest per color: {num_rest}")
 
         self.image_size = torch.zeros((self._triangle_indices.shape[0]), dtype=torch.float, device="cuda")

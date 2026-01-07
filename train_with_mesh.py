@@ -1,5 +1,7 @@
-import os
 import sys
+sys.path.append('../camera-control')
+
+import os
 import uuid
 import torch
 import lpips
@@ -10,78 +12,19 @@ from tqdm import tqdm
 from random import randint
 from argparse import ArgumentParser, Namespace
 from torch.utils.tensorboard import SummaryWriter
-from utils.loss_utils import l1_loss, ssim, vertex_depth_loss_hr
+
+from fused_ssim import fused_ssim
 
 from scene.cameras import Camera
 from triangle_renderer import render
 from scene import Scene, TriangleModel
-from utils.general_utils import safe_state, get_expon_lr_func
 from utils.image_utils import psnr
+from utils.general_utils import safe_state, get_expon_lr_func
+from utils.loss_utils import l1_loss, ssim, vertex_depth_loss_hr
 from arguments import ModelParams, PipelineParams, OptimizationParams, update_indoor
 
-from fused_ssim import fused_ssim
+from camera_control.Method.io import loadMeshFile
 
-
-class LoadedScene:
-    """
-    A simple scene class to hold data loaded from custom files (.npy, .ply).
-    This class mimics the structure of the original Scene class so that
-    it can be used interchangeably in the training loop.
-    """
-    def __init__(self, train_cams, test_cams, triangles, white_background, model_path):
-        self.train_cameras = train_cams
-        self.test_cameras = test_cams
-        self.triangles = triangles
-        self.white_background = white_background
-        self.model_path = model_path
-
-    def getTrainCameras(self):
-        return self.train_cameras
-
-    def getTestCameras(self):
-        return self.test_cameras
-
-    def save(self, iteration):
-        # A simplified save method for the loaded mesh
-        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        os.makedirs(point_cloud_path, exist_ok=True)
-        self.triangles.save_ply(os.path.join(point_cloud_path, "triangles.ply"))
-
-def load_cameras_from_npy(dataset):
-    """
-    Loads cameras from .npy files containing images and poses.
-    """
-    images = np.load(dataset.images_npy)
-    poses = np.load(dataset.poses_npy) # Assumes (N, 4, 4) camera-to-world matrices
-
-    cameras = []
-    
-    height, width = images.shape[1], images.shape[2]
-    # Calculate FoV
-    fov_rad = dataset.fov * np.pi / 180.0
-    FovY = fov_rad
-    FovX = 2 * np.arctan(width / (2 * height / np.tan(FovY / 2)))
-
-    for i in range(len(images)):
-        # Normalize image and permute to (C, H, W)
-        img_data = torch.from_numpy(images[i]).permute(2,0,1).float() / 255.0
-
-        # Get camera-to-world pose
-        c2w = poses[i]
-        
-        # Extract rotation and translation
-        R = c2w[:3, :3]
-        T = c2w[:3, 3]
-        
-        cameras.append(Camera(colmap_id=i, R=R, T=T, FoVx=FovX, FoVy=FovY, 
-                                    image=img_data, gt_alpha_mask=None, image_name=f"cam_{i}", uid=i))
-    
-    # Split into training and testing sets (80/20 split)
-    num_train = int(len(cameras) * 0.8)
-    train_cameras = cameras[:num_train]
-    test_cameras = cameras[num_train:]
-
-    return train_cameras, test_cameras
 
 def training(
         dataset,
@@ -95,18 +38,15 @@ def training(
     tb_writer = prepare_output_and_logger(dataset)
 
     # Load parameters, triangles and scene based on provided arguments
-    if hasattr(dataset, 'mesh_file') and dataset.mesh_file:
+    if dataset.mesh_file != "":
         print("Loading mesh from", dataset.mesh_file)
-        triangles_dict = load_mesh(dataset.mesh_file, device="cuda")
+        mesh = loadMeshFile(dataset.mesh_file)
         triangles = TriangleModel(dataset.sh_degree)
-        triangles.restore_from_dict(triangles_dict)
-        
-        print("Loading images from", dataset.images_npy, "and poses from", dataset.poses_npy)
-        train_cams, test_cams = load_cameras_from_npy(dataset)
-        scene = LoadedScene(train_cams, test_cams, triangles, dataset.white_background, dataset.model_path)
+        triangles.load_mesh(mesh)
     else:
         triangles = TriangleModel(dataset.sh_degree)
-        scene = Scene(dataset, triangles, opt.set_weight, opt.set_sigma)
+
+    scene = Scene(dataset, triangles, opt.set_weight, opt.set_sigma)
 
     triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
     triangles.add_percentage = opt.add_percentage
