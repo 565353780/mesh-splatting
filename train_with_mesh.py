@@ -5,7 +5,6 @@ import os
 import uuid
 import torch
 import lpips
-import numpy as np
 import torch.nn.functional as F
 
 from tqdm import tqdm
@@ -15,7 +14,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 from fused_ssim import fused_ssim
 
-from scene.cameras import Camera
 from triangle_renderer import render
 from scene import Scene, TriangleModel
 from utils.image_utils import psnr
@@ -37,19 +35,54 @@ def training(
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
 
-    # Load parameters, triangles and scene based on provided arguments
-    if dataset.mesh_file != "":
-        print("Loading mesh from", dataset.mesh_file)
-        mesh = loadMeshFile(dataset.mesh_file)
-        triangles = TriangleModel(dataset.sh_degree)
-        triangles.load_mesh(mesh)
-    else:
-        triangles = TriangleModel(dataset.sh_degree)
+    # Validate mesh file is provided
+    if not dataset.mesh_file or dataset.mesh_file == "":
+        raise ValueError("mesh_file is required! Please provide a valid mesh file path using --mesh_file argument.")
+
+    # Load mesh from file
+    print("Loading mesh from", dataset.mesh_file)
+    mesh = loadMeshFile(dataset.mesh_file)
+
+    if mesh is None:
+        raise ValueError(f"Failed to load mesh from {dataset.mesh_file}")
+
+    triangles = TriangleModel(dataset.sh_degree)
+    triangles.load_mesh(mesh)
+
+    # Validate mesh was loaded correctly
+    if triangles.vertices.shape[0] == 0:
+        raise ValueError("Mesh has no vertices!")
+    if triangles._triangle_indices.shape[0] == 0:
+        raise ValueError("Mesh has no faces!")
+
+    print(f"Mesh loaded successfully:")
+    print(f"  - Vertices: {triangles.vertices.shape[0]}")
+    print(f"  - Faces: {triangles._triangle_indices.shape[0]}")
+    print(f"  - SH degree: {triangles.active_sh_degree}")
 
     scene = Scene(dataset, triangles, opt.set_weight, opt.set_sigma)
 
-    triangles.training_setup(opt, opt.feature_lr, opt.weight_lr, opt.lr_triangles_points_init)
-    triangles.add_percentage = opt.add_percentage
+    # Setup optimizer for vertex positions only (fixed topology mode)
+    # In fix_topology mode, only vertex positions are optimized
+    # RGB and opacity are fixed at 1.0 and not optimized
+    print("Optimizing only vertex positions (fixed topology).")
+    print("RGB and opacity are fixed at 1.0 and will not be optimized.")
+    triangles.optimizer = torch.optim.Adam(
+        [{'params': [triangles.vertices], 'lr': opt.lr_triangles_points_init, "name": "vertices"}],
+        lr=0.0, eps=1e-15)
+
+    # Disable gradients for other parameters to ensure only vertices are optimized
+    # RGB features (features_dc and features_rest) are fixed
+    triangles._features_dc.requires_grad_(False)
+    triangles._features_rest.requires_grad_(False)
+    # Opacity (vertex_weight) is fixed at 1.0 and not optimized
+    triangles.vertex_weight.requires_grad_(False)
+
+    triangles.triangle_scheduler_args = get_expon_lr_func(
+        lr_init=opt.lr_triangles_points_init,
+        lr_final=opt.lr_triangles_points_init/100,
+        lr_delay_mult=opt.position_lr_delay_mult,
+        max_steps=opt.position_lr_max_steps)
 
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -62,47 +95,25 @@ def training(
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = scene.getTrainCameras().copy()
-    number_of_training_views = len(viewpoint_stack)
 
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    # define the scheduler for sigma and opacity
+    # Sigma schedule parameters
     initial_sigma = opt.set_sigma
     final_sigma = 0.0001
     sigma_start = opt.sigma_start
     total_iters = opt.sigma_until
 
-    init_opacity = 0.1
-    final_opacity = .9999
-    total_iters_opacity = opt.final_opacity_iter
-
-    lambda_weight = opt.lambda_weight
-    prune_triangles = opt.prune_triangles_threshold
-    prune_size = opt.prune_size
-    start_upsampling = opt.start_upsampling
-    splitt_large_triangles = opt.splitt_large_triangles
-    triangles.size_probs_zero = opt.size_probs_zero
-    triangles.size_probs_zero_image_space = opt.size_probs_zero_image_space
-
-    need_delaunay = False
-
-    run_restricted_delaunay = opt.densify_until_iter + 1000
-
     depth_l1_weight = get_expon_lr_func(opt.depth_lambda_init, opt.depth_lambda_final, max_steps=opt.iterations)
 
     for iteration in range(first_iter, opt.iterations + 1):
 
-        if need_delaunay:
-            with torch.no_grad():
-                triangles.run_restricted_delaunay()
-            need_delaunay = False
-
         # Supersampling
-        if iteration == start_upsampling:
+        if iteration == opt.start_upsampling:
             triangles.scaling = opt.upscaling_factor
-        if iteration == start_upsampling + 5000:
+        if iteration == opt.start_upsampling + 5000:
             triangles.scaling = 4
 
         iter_start.record()
@@ -127,10 +138,8 @@ def training(
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if not viewpoint_stack or len(scene.getTrainCameras()) + iteration == opt.iterations:
+        if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-            if len(scene.getTrainCameras()) + iteration == opt.iterations:
-                triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda") # reset to 0 to ensure that everything is deleted with an importance score of 0
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         render_pkg = render(viewpoint_cam, triangles, pipe, bg)
@@ -148,37 +157,12 @@ def training(
 
         pixel_loss = l1_loss(image, gt_image)
 
-        image_size = render_pkg["scaling"].detach()
-        mask = image_size > triangles.image_size
-        triangles.image_size[mask] = image_size[mask]
-
-        importance_score = render_pkg["max_blending"].detach()
-        mask = importance_score > triangles.importance_score
-        triangles.importance_score[mask] = importance_score[mask]
-
-        pixel_count = render_pkg["triangle_was_rendered"].detach() # Not used but could be useful. Gives per triangle, the number of pixels it covered in the current render
-        mask = pixel_count > triangles.pixel_count
-        triangles.pixel_count[mask] = pixel_count[mask]
-
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
 
         loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim_value)
-    
 
         # FINAL LOSS
         loss = loss_image
-
-        # Opacity loss
-        Lweight_pure = 0.0
-        lambda_weight = opt.lambda_weight if iteration < opt.start_opacity_floor else 0
-        if lambda_weight > 0:
-            mask_out = triangles.vertices.shape[0]
-            vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
-            Lweight_pure = vertex_weights.mean()
-            Lweight = lambda_weight * Lweight_pure
-            loss += Lweight
-        else:
-            Lweight = 0
 
         # Vertex depth regularization
         Lvertex_depth_pure = 0.0
@@ -236,7 +220,6 @@ def training(
         loss.backward()
         iter_end.record()
 
-        
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -250,119 +233,17 @@ def training(
                 progress_bar.close()
 
             # Log and save
-            
             training_report(tb_writer, scene_name, iteration, pixel_loss, loss, l1_loss, iter_start.elapsed_time(iter_end), scene, render, (pipe, background))
-
-            # Handle pruning operations
-            if iteration % 500 == 0 and iteration < run_restricted_delaunay:
-                
-                # Building masks to delete triangles
-                triangle_vertex_weights = triangles.opacity_activation(
-                    triangles.vertex_weight[triangles._triangle_indices]
-                ) 
-                min_weights = triangle_vertex_weights.min(dim=1).values
-
-                mask_opacity     = (min_weights <= prune_triangles).squeeze()              # delete if too low
-                mask_importance  = (triangles.importance_score <= prune_triangles).squeeze()  # delete if too low
-                mask_size        = (triangles.image_size > prune_size).squeeze()                 # delete if too big
-
-                delete_mask = mask_opacity | mask_size
-
-                if number_of_training_views < 500: # only delete if the number of views are below 500. Otherwise, we might delete too much
-                    delete_mask = delete_mask | mask_importance
-
-                keep_mask   = ~delete_mask 
-
-                if iteration > opt.start_pruning:
-                    triangles.prune_triangles(keep_mask)
-             
-                # We prune vertices that are no longer used
-                device = triangles.vertices.device
-                used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 
-                                            dtype=torch.bool, 
-                                            device=device)
-                if triangles._triangle_indices.numel() > 0:
-                    flat_indices = triangles._triangle_indices.flatten()
-                    used_vertex_mask[flat_indices] = True
-                
-                weight_mask = (triangles.get_vertex_weight.squeeze() >= prune_triangles)
-                mask_out = triangles.vertices.shape[0]
-                vertex_mask = weight_mask[:mask_out] | used_vertex_mask
-
-                triangles._prune_vertices(vertex_mask)
-
-
-                triangle_vertex_weights = triangles.opacity_activation(
-                    triangles.vertex_weight[triangles._triangle_indices]
-                )  # [T,3]
-
-                needs_densification = (iteration < opt.densify_until_iter and 
-                                     iteration % opt.densification_interval == 0 and 
-                                     iteration > opt.densify_from_iter)
-                
-                if needs_densification:
-                    triangles.add_new_gs(iteration, cap_max=opt.max_points, splitt_large_triangles=splitt_large_triangles)
-   
-
-                if iteration > opt.start_opacity_floor:
-                    start_iter = opt.start_opacity_floor
-                    end_iter = total_iters_opacity  # the iteration where you want to reach final_opacity
-                    a = min(1.0, max(0.0, (iteration - start_iter) / max(1, end_iter - start_iter)))
-                    current_opacity = init_opacity + (final_opacity - init_opacity) * a
-                    current_opacity = min(current_opacity, final_opacity)
-                    triangles.update_min_weight(current_opacity)
-
-                    prune_triangles += 0.01 
-                    mask_out = triangles.vertices.shape[0]
-                    triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
-            elif iteration == run_restricted_delaunay:
-                need_delaunay = True
-            elif iteration % 500 == 0 and iteration > run_restricted_delaunay + 1000:
-
-                if iteration > opt.start_opacity_floor:
-                    start_iter = opt.start_opacity_floor
-                    end_iter = total_iters_opacity  # the iteration where you want to reach final_opacity
-                    a = min(1.0, max(0.0, (iteration - start_iter) / max(1, end_iter - start_iter)))
-                    current_opacity = init_opacity + (final_opacity - init_opacity) * a
-                    current_opacity = min(current_opacity, final_opacity)
-                    triangles.update_min_weight(current_opacity)
-
-                    prune_triangles += 0.01 
-                    mask_out = triangles.vertices.shape[0]
-                    triangle_vertex_weights = triangles.get_vertex_weight[:mask_out][triangles._triangle_indices]
-            
 
             if iteration < opt.iterations:
                 triangles.optimizer.step()
                 triangles.optimizer.zero_grad(set_to_none = True)
 
-    # cleaning of triangles that we do not need
-    viewpoint_stack = scene.getTrainCameras().copy()
-    triangles.importance_score = torch.zeros((triangles._triangle_indices.shape[0]), dtype=torch.float, device="cuda")
-    while viewpoint_stack:
-        viewpoint_cam = viewpoint_stack.pop(0)
-        render_pkg = render(viewpoint_cam, triangles, pipe, bg)
-
-        importance_score = render_pkg["max_blending"].detach()
-        mask = importance_score > triangles.importance_score
-        triangles.importance_score[mask] = importance_score[mask]
-    mask_importance  = (triangles.importance_score <= 0.5).squeeze() 
-    triangles.prune_triangles(~mask_importance) # delete all the remaining triangles that do not have an influence
-
-    device = triangles.vertices.device
-    used_vertex_mask = torch.zeros(triangles.vertices.shape[0], 
-                                dtype=torch.bool, 
-                                device=device)
-    if triangles._triangle_indices.numel() > 0:
-        # Flatten indices and mark used vertices
-        flat_indices = triangles._triangle_indices.flatten()
-        used_vertex_mask[flat_indices] = True
-    
-    vertex_mask = used_vertex_mask
-    triangles._prune_vertices(vertex_mask)
-
-    scene.save(iteration)          
+    scene.save(iteration)
     print("Training is done")
+    print(f"Final mesh statistics:")
+    print(f"  - Vertices: {triangles.vertices.shape[0]}")
+    print(f"  - Faces: {triangles._triangle_indices.shape[0]}")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

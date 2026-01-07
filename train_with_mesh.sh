@@ -9,7 +9,8 @@ LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib/stubs:$LIBRARY_PATH \
   --mesh_file ${DATA_FOLDER}/gold_dragon.glb \
   --indoor \
   --eval \
-  --iterations ${ITERATIONS}
+  --iterations ${ITERATIONS} \
+  --fix_topology
 
 python create_ply.py \
   ${DATA_FOLDER}/meshsplatting/point_cloud/iteration_${ITERATIONS}/ \

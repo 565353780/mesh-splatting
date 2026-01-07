@@ -54,14 +54,14 @@ def random_rotation_matrices(num_matrices, device='cpu'):
     K[:, 1, 2] = -ux
     K[:, 2, 0] = -uy
     K[:, 2, 1] =  ux
-    
+
     K2 = K.bmm(K)
-    
+
     I = torch.eye(3, device=device).unsqueeze(0).expand(num_matrices, -1, -1)
-    
+
     sin_term = sin_t.view(-1, 1, 1) * K
     cos_term = (1.0 - cos_t).view(-1, 1, 1) * K2
-    
+
     return I + sin_term + cos_term
 
 
@@ -76,10 +76,10 @@ def fibonacci_directions(nb_points, device='cpu'):
         z_coord = torch.tensor(z_coord, device=device)
         radius_xy = torch.sqrt(1.0 - z_coord * z_coord)
         theta = math.pi * (3.0 - math.sqrt(5.0)) * i
-        
+
         x_unit = radius_xy * torch.cos(torch.tensor(theta, device=device))
         y_unit = radius_xy * torch.sin(torch.tensor(theta, device=device))
-        
+
         directions.append(torch.stack([x_unit, y_unit, z_coord]))
     return torch.stack(directions, dim=0)
 
@@ -223,11 +223,10 @@ class TriangleModel:
         verts = torch.from_numpy(verts_np).to(device=device, dtype=torch.float32).detach().clone().requires_grad_(True)
         faces = torch.from_numpy(faces_np).to(device=device, dtype=torch.int32)
 
-        # features_dc: infer from colors if available, otherwise default to gray which maps to f_dc=0
-        if colors01 is not None and colors01.shape[0] == V:
-            f_dc_rgb = ((colors01 - 0.5) / SH_C0).clip(-4.0, 4.0).astype(np.float32)
-        else:
-            f_dc_rgb = np.zeros((V, 3), dtype=np.float32)
+        # features_dc: initialize to white (RGB=1.0) which maps to f_dc=(1.0-0.5)/SH_C0
+        # Force RGB to 1.0 (white) regardless of mesh colors
+        rgb_white = np.ones((V, 3), dtype=np.float32)  # RGB = [1.0, 1.0, 1.0]
+        f_dc_rgb = ((rgb_white - 0.5) / SH_C0).clip(-4.0, 4.0).astype(np.float32)
         features_dc = torch.from_numpy(f_dc_rgb).to(device=device, dtype=torch.float32).unsqueeze(1).detach().clone().requires_grad_(True)
 
         # features_rest: zeros with shape [V, (deg+1)^2 - 1, 3]
@@ -243,6 +242,7 @@ class TriangleModel:
         self._features_dc = features_dc.requires_grad_(True)
         self._features_rest = features_rest.requires_grad_(True)
 
+        # Initialize opacity to 1.0 (fully opaque)
         opacity_weight = 1.0
         self.opacity_floor = 0.9999
         vert_weight = inverse_sigmoid(opacity_weight * torch.ones((self.vertices.shape[0], 1), dtype=torch.float, device="cuda")) 
@@ -288,7 +288,7 @@ class TriangleModel:
         self._features_dc        = state["features_dc"].to(device).to(torch.float32).detach().clone().requires_grad_(True)
         self._features_rest      = state["features_rest"].to(device).to(torch.float32).detach().clone().requires_grad_(True)
         self.importance_score = state["importance_score"].to(device).to(torch.float32).detach().clone().requires_grad_(True)
-        
+
         print("triangles: ", self._triangle_indices.shape)
         print("vertices: ", self.vertices.shape)
 

@@ -93,7 +93,7 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 10000
 
         self.random_background = False
-        
+
         self.feature_lr = 0.0016 # 0.0025
         self.max_points = 4000000
 
@@ -145,6 +145,8 @@ class OptimizationParams(ParamGroup):
 
         self.depth_lambda_init = 0.01
         self.depth_lambda_final = 0.001
+
+        self.fix_topology = False
 
         super().__init__(parser, "Optimization Parameters")
 

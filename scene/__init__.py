@@ -78,11 +78,22 @@ class Scene:
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
 
-        if self.loaded_iter:
+        # Check if triangles already have mesh data loaded (vertices and faces)
+        mesh_already_loaded = (
+            hasattr(self.triangles, 'vertices') and 
+            hasattr(self.triangles, '_triangle_indices') and
+            self.triangles.vertices.shape[0] > 0 and 
+            self.triangles._triangle_indices.shape[0] > 0
+        )
+
+        if mesh_already_loaded:
+            print("Triangles already have mesh data loaded. Skipping initialization from point cloud or checkpoint.")
+            print(f"  - Vertices: {self.triangles.vertices.shape[0]}")
+            print(f"  - Faces: {self.triangles._triangle_indices.shape[0]}")
+        elif self.loaded_iter:
             self.triangles.load_parameters(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
-                                                           
                                                 ), segment=segment, ratio_threshold=ratio_threshold
                                     )
         else:
