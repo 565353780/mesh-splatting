@@ -396,7 +396,7 @@ def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn,
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report samples of training set
-    if iteration % 1000 == 0 or iteration % 1000 == 1:
+    if iteration % 1000 == 0 or iteration == 1:
         torch.cuda.empty_cache()
         config = {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
 
@@ -419,7 +419,7 @@ def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn,
                 gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                 if tb_writer and (idx < 5):
                     tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                    if iteration <= 1000:
+                    if iteration == 1:
                         tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                 pixel_loss_test += loss_fn(image, gt_image).mean().double()
                 psnr_test += psnr(image, gt_image).mean().double()
@@ -442,7 +442,6 @@ def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn,
                 tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         torch.cuda.empty_cache()
-        exit()
 
 if __name__ == "__main__":
     # Set up command line argument parser
