@@ -92,7 +92,7 @@ def training(
     splitt_large_triangles = opt.splitt_large_triangles
     triangles.size_probs_zero = opt.size_probs_zero
     triangles.size_probs_zero_image_space = opt.size_probs_zero_image_space
-    
+
     need_delaunay = False
 
     run_restricted_delaunay = opt.densify_until_iter + 1000

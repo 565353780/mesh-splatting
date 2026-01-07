@@ -1,5 +1,5 @@
 DATA_FOLDER=$HOME/chLi/Dataset/MM/Match/gold_dragon
-ITERATIONS=3000
+ITERATIONS=30000
 
 LIBRARY_PATH=/usr/local/cuda-12.4/targets/x86_64-linux/lib/stubs:$LIBRARY_PATH \
   CUDA_VISIBLE_DEVICES=3 \
