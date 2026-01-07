@@ -31,41 +31,19 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams, update_indoor
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
-except ImportError:
-    TENSORBOARD_FOUND = False
+from torch.utils.tensorboard import SummaryWriter
 import lpips
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
-try:
-    from fused_ssim import fused_ssim
-    FUSED_SSIM_AVAILABLE = True
-    print("Using fused SSIM for faster training.")
-except:
-    FUSED_SSIM_AVAILABLE = False
-try:
-    from diff_triangle_rasterization import SparseGaussianAdam
-    SPARSE_ADAM_AVAILABLE = True
-    print("Sparse Adam optimizer available")
-except:
-    SPARSE_ADAM_AVAILABLE = False
-from utils.render_utils import generate_path, create_videos
-
+from fused_ssim import fused_ssim
 
 
 def training(
         dataset,   
         opt, 
         pipe,
-        testing_iterations,
         checkpoint, 
         debug_from,
         scene_name,
-        use_sparse_adam=False
         ):
     
     first_iter = 0
@@ -189,10 +167,7 @@ def training(
         mask = pixel_count > triangles.pixel_count
         triangles.pixel_count[mask] = pixel_count[mask]
 
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_value = ssim(image, gt_image)
+        ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
 
         loss_image = (1.0 - opt.lambda_dssim) * pixel_loss + opt.lambda_dssim * (1.0 - ssim_value)
     
@@ -283,7 +258,7 @@ def training(
 
             # Log and save
             
-            training_report(tb_writer, scene_name, iteration, pixel_loss, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, scene_name, iteration, pixel_loss, loss, l1_loss, iter_start.elapsed_time(iter_end), scene, render, (pipe, background))
 
             # Handle pruning operations
             if iteration % 500 == 0 and iteration < run_restricted_delaunay:
@@ -411,68 +386,63 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
     # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
+    tb_writer = SummaryWriter(args.model_path)
     return tb_writer
 
-def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, scene_name, iteration, pixel_loss, loss, loss_fn, elapsed, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/pixel_loss', pixel_loss.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
-    if iteration % 1000 == 0:
+    # Report samples of training set
+    if iteration % 1000 == 0 or iteration % 1000 == 1:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        config = {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
 
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                pixel_loss_test = 0.0
-                psnr_test = 0.0
-                ssim_test = 0.0
-                lpips_test = 0.0
-                total_time = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                    image = torch.clamp(renderFunc(viewpoint, scene.triangles, *renderArgs)["render"], 0.0, 1.0)
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    runtime = start_event.elapsed_time(end_event)
-                    total_time += runtime
+        if config['cameras'] and len(config['cameras']) > 0:
+            pixel_loss_test = 0.0
+            psnr_test = 0.0
+            ssim_test = 0.0
+            lpips_test = 0.0
+            total_time = 0.0
+            for idx, viewpoint in enumerate(config['cameras']):
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+                image = torch.clamp(renderFunc(viewpoint, scene.triangles, *renderArgs)["render"], 0.0, 1.0)
+                end_event.record()
+                torch.cuda.synchronize()
+                runtime = start_event.elapsed_time(end_event)
+                total_time += runtime
 
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    pixel_loss_test += loss_fn(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                    ssim_test += ssim(image, gt_image).mean().double()
-                    lpips_test += lpips_fn(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                pixel_loss_test /= len(config['cameras'])       
-                ssim_test /= len(config['cameras'])
-                lpips_test /= len(config['cameras'])  
-                total_time /= len(config['cameras'])
-                fps = 1000.0 / total_time
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {} FPS {}".format(iteration, config['name'], pixel_loss_test, psnr_test, ssim_test, lpips_test, fps))
+                gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                if tb_writer and (idx < 5):
+                    tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                    if iteration <= 1000:
+                        tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                pixel_loss_test += loss_fn(image, gt_image).mean().double()
+                psnr_test += psnr(image, gt_image).mean().double()
+                ssim_test += ssim(image, gt_image).mean().double()
+                lpips_test += lpips_fn(image, gt_image).mean().double()
+            psnr_test /= len(config['cameras'])
+            pixel_loss_test /= len(config['cameras'])       
+            ssim_test /= len(config['cameras'])
+            lpips_test /= len(config['cameras'])  
+            total_time /= len(config['cameras'])
+            fps = 1000.0 / total_time
+            print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {} FPS {}".format(iteration, config['name'], pixel_loss_test, psnr_test, ssim_test, lpips_test, fps))
 
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+            if tb_writer:
+                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
+                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+            if tb_writer:
+                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', pixel_loss_test, iteration)
+                tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         torch.cuda.empty_cache()
+        exit()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -482,7 +452,6 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -490,7 +459,6 @@ if __name__ == "__main__":
 
     parser.add_argument('--wandb_name', default="Test", type=str)
     parser.add_argument('--scene_name', default="Garden", type=str)
-    parser.add_argument("--use_sparse_adam", action="store_true", default=True)
     parser.add_argument("--indoor", action="store_true", default=False)
 
     args = parser.parse_args(sys.argv[1:])
@@ -515,11 +483,9 @@ if __name__ == "__main__":
     training(lps,
              ops,
              pps,
-             args.test_iterations,
              args.start_checkpoint,
              args.debug_from,
              args.scene_name,
-             use_sparse_adam=args.use_sparse_adam
              )
     
     # All done
